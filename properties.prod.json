@@ -1,0 +1,9 @@
+{
+    "app_name": "terraformExampleApp",
+    "core_name": "terraformExampleCore",
+    "route53": {
+        "domain_name": "example.com",
+        "ttl": 60
+    }
+}
+
