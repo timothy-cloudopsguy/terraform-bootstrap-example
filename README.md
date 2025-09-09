@@ -2,6 +2,8 @@
 
 This repository is an opinionated example showing how to bootstrap Terraform state and deploy a blue/green frontend behind CloudFront using a per-repository S3 backend (S3 is used for both state and locking). The included `tfwrapper` script automates the bootstrapping, state migration, and common `terraform` workflows so you can initialize and apply the example infrastructure quickly.
 
+![demo recording](./render1757429656886.gif)
+
 Quickstart & usage (tfwrapper)
 - `tfwrapper` provides a small CLI to bootstrap and manage Terraform for this repo. It supports `bootstrap`, `init`, `plan`, and `apply` commands and accepts an environment selection either via the `ENV` environment variable or the `-e` / `--env` flag.
 - Important behavior to know up-front:
