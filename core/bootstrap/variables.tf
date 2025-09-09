@@ -16,12 +16,6 @@ variable "bucket_name" {
   default     = ""
 }
 
-variable "dynamodb_table_name" {
-  description = "DynamoDB table name for Terraform state locks"
-  type        = string
-  default     = ""
-}
-
 variable "kms_key_id" {
   description = "Optional KMS key id for bucket encryption"
   type        = string

@@ -1,0 +1,7 @@
+{
+    "data":[
+        {"key": "routing-api", "value": "{\"weight\": 0, \"green\": \"initial\", \"blue\": \"initial\"}"},
+        {"key": "routing-app", "value": "{\"weight\": 0, \"green\": \"initial\", \"blue\": \"initial\"}"},
+        {"key": "routing-subscriptions", "value": "{\"weight\": 0, \"green\": \"initial\", \"blue\": \"initial\"}"}
+    ]
+}

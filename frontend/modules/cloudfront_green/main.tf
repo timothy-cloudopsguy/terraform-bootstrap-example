@@ -4,6 +4,7 @@ variable "origin_domain" { type = string }
 variable "certificate_arn" { type = string }
 variable "route53_ttl" { type = number }
 variable "color" { type = string }
+variable "core_name" { type = string }
 
 locals {
   cert_arn = var.certificate_arn
@@ -38,6 +39,12 @@ resource "aws_s3_bucket_public_access_block" "cf_logs_block" {
 data "aws_ssm_parameter" "bucket_website_domain_name" {
   name = "/${var.app_name}/s3/${var.color}/bucket_website_domain_name"
 }
+
+# Example of how to use the core_name to get the certificate ARN, we don't use this one in this code.
+data "aws_ssm_parameter" "cert_arn_ssm" {
+  name  = "/${var.core_name}/ssl/cert_arn"
+}
+
 
 resource "aws_cloudfront_cache_policy" "cache_policy" {
   name        = "${var.app_name}-${var.color}-cache-policy"

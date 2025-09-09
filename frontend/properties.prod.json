@@ -2,7 +2,7 @@
     "app_name": "terraformExampleApp",
     "core_name": "terraformExampleCore",
     "route53": {
-        "domain_name": "example.com",
+        "domain_name": "verihire.cc",
         "ttl": 60
     }
 }

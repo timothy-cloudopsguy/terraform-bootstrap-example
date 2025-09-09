@@ -1,0 +1,5 @@
+{
+    "routing-api": {"weight": 0, "green": "initial", "blue": "initial"},
+    "routing-app": {"weight": 0, "green": "initial", "blue": "initial"},
+    "routing-subscriptions": {"weight": 0, "green": "initial", "blue": "initial"}
+}

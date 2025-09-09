@@ -45,6 +45,7 @@ module "cloudfront_blue" {
   certificate_arn = module.ssl_root.certificate_arn
   route53_ttl = local.route53.ttl
   color = "blue"
+  core_name = local.core_name
   depends_on = [module.ssl_root, module.s3_blue]
 }
 
@@ -57,6 +58,7 @@ module "cloudfront_green" {
   certificate_arn = module.ssl_root.certificate_arn
   route53_ttl = local.route53.ttl
   color = "green"
+  core_name = local.core_name
   depends_on = [module.ssl_root, module.s3_green]
 }
 
