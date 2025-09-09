@@ -82,7 +82,7 @@ Sharing values between stacks
 
 Blue/green example notes
 - This code models a blue/green deployment for a frontend application behind CloudFront, with separate `blue` and `green` site buckets and CloudFront distributions.
-- A higher-level routing layer (not included in this repo) is responsible for directing traffic to the blue or green variant. That routing can be implemented by:
+- A higher-level routing layer (included in this repo as "core") is responsible for directing traffic to the blue or green variant. That routing can be implemented by:
   - CloudFront key-value store / request routing (CloudFront Functions or Lambda@Edge decision logic), or
   - A top-level CloudFront + Route53 setup that uses TXT records or other control-plane signals to act as a decision tree (the top-level CloudFront performs routing decisions but does not perform caching for this purpose).
 
