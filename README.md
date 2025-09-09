@@ -1,6 +1,6 @@
 # terraform-bootstrap-example
 
-This repository is an opinionated example showing how to bootstrap Terraform state and deploy a blue/green frontend behind CloudFront using a per-repository S3 + DynamoDB backend. The included `tfwrapper` script automates the bootstrapping, state migration, and common `terraform` workflows so you can initialize and apply the example infrastructure quickly.
+This repository is an opinionated example showing how to bootstrap Terraform state and deploy a blue/green frontend behind CloudFront using a per-repository S3 backend (S3 is used for both state and locking). The included `tfwrapper` script automates the bootstrapping, state migration, and common `terraform` workflows so you can initialize and apply the example infrastructure quickly.
 
 Quickstart & usage (tfwrapper)
 - `tfwrapper` provides a small CLI to bootstrap and manage Terraform for this repo. It supports `bootstrap`, `init`, `plan`, and `apply` commands and accepts an environment selection either via the `ENV` environment variable or the `-e` / `--env` flag.
@@ -38,14 +38,14 @@ Ordering and dependencies
   2. Run `tfwrapper` for the `frontend` stack (plan/apply) once `core` is present.
 
 Why this repo exists
-- **Safe, isolated Terraform state**: The bootstrap creates an S3 bucket and a DynamoDB table scoped to this repository/stack so the remote backend is coupled to this repo only (not a shared/global bucket). That reduces blast radius if state becomes corrupted.
+- **Safe, isolated Terraform state**: The bootstrap creates an S3 bucket scoped to this repository/stack and uses S3 for both state storage and locking so the remote backend is coupled to this repo only (not a shared/global bucket). That reduces blast radius if state becomes corrupted. This is a much simpler solution.
 - **Example blue/green frontend**: The Terraform code shows a blue/green deployment pattern for a static/frontend application served via CloudFront and S3.
 
 How the bootstrap works (high level)
 - Run `./tfwrapper` from the repo root. The script:
   - Reads the `ENV` environment variable or `-e/--env` flag to determine which `properties.<ENV>.json` file to use; the bootstrap step uses the same environment selection so the same environment/region/account locking applies during bootstrap.
-  - Runs a small bootstrap Terraform workspace (in `bootstrap/`) that creates an S3 bucket and DynamoDB table used for Terraform remote state and locking.
-  - Migrates local state into that newly-created S3/DynamoDB backend and then runs the normal plan/apply flow for the example stack.
+  - Runs a small bootstrap Terraform workspace (in `bootstrap/`) that creates an S3 bucket used for Terraform remote state and locking.
+  - Migrates local state into that newly-created S3 backend and then runs the normal plan/apply flow for the example stack.
   - Ensures `backend.tf` is created/managed safely during the migration to avoid accidentally clobbering other backends.
 
 Environment properties (`properties.<ENV>.json`)
@@ -60,8 +60,8 @@ Environment properties (`properties.<ENV>.json`)
 Per-repo backend vs a global backend (and CloudFormation comparison)
 - **Per-repo backend (this repo)**
   - Pros: Isolation — state corruption or accidental deletes are limited to this stack. Easier to reason about ownership and lifecycle per project. You can still export values using Terraform outputs and publish important values to SSM Parameter Store for cross-stack consumption.
-  - Cons: More S3/DynamoDB resources to manage (one per repo/stack).
-- **Global backend (single S3/DynamoDB for many stacks)**
+  - Cons: More S3 resources to manage (one per repo/stack).
+- **Global backend (single S3 for many stacks)**
   - Pros: Fewer backend resources to manage centrally; easier to standardize configuration.
   - Cons: Higher blast radius — corruption or misconfiguration could affect many stacks at once.
 - **CloudFormation model**
@@ -71,7 +71,7 @@ Idempotent bootstrap & SSM-stored backend metadata
 - `tfwrapper` is written to be idempotent: it checks for existing backend configuration and the SSM parameter the bootstrap creates before attempting to create backend resources.
 - The bootstrap step will create an SSM Parameter that stores the backend content (the backend HCL or equivalent metadata). On subsequent runs `tfwrapper` will read that SSM parameter and reuse the stored backend configuration instead of re-bootstrapping.
   - If the SSM parameter exists and contains valid backend information, the script uses it directly.
-  - If the SSM parameter does not exist (first run or intentionally removed), the script runs the bootstrap Terraform under `bootstrap/`, creates the S3 bucket and DynamoDB table, and then writes the backend content into the SSM parameter for future runs.
+  - If the SSM parameter does not exist (first run or intentionally removed), the script runs the bootstrap Terraform under `bootstrap/`, creates the S3 bucket, and then writes the backend content into the SSM parameter for future runs.
 - This pattern provides a safe, repeatable bootstrap that avoids recreating or clobbering backend resources once they exist, and makes the script safe to re-run in CI/CD or local workflows.
 
 Sharing values between stacks
@@ -85,7 +85,7 @@ Blue/green example notes
   - A top-level CloudFront + Route53 setup that uses TXT records or other control-plane signals to act as a decision tree (the top-level CloudFront performs routing decisions but does not perform caching for this purpose).
 
 Notes & caveats
-- `tfwrapper` contains helpful logic around creating a minimal `backend.tf` and migrating state; read the script if you need to adjust naming, region, or table names (there is an override for the DynamoDB table if required).
+- `tfwrapper` contains helpful logic around creating a minimal `backend.tf` and migrating state; read the script if you need to adjust naming, region, or table names (there is an override for the S3 locking configuration if required).
 - The bootstrap creates and/or reuses an SSM Parameter containing backend metadata — the script checks this parameter on each run so the bootstrap is safe to run repeatedly.
 - If you need cross-stack references, prefer SSM Parameter Store or explicit exported values rather than directly coupling into another stack's state file.
 
