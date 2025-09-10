@@ -1,465 +1,445 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+import argparse
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
 
-# tfwrapper
-# Manage terraform remote backend via SSM parameter or by running bootstrap terraform.
-# Usage:
-#   ./tfwrapper bootstrap [-e ENV] [-r REGION] [--target-dir PATH] [--app-name NAME]
-#   ./tfwrapper plan|apply|destroy|destroy-all [-e ENV] [-r REGION] [--target-dir PATH] [--force] [--force-copy] [--app-name NAME]
-#
-# Behavior:
-# - Synthesizes APP_NAME (from properties.${ENV}.json unless --app-name supplied) and ACCOUNT_ID.
-# - Looks for SSM parameter at /terraform/${ACCOUNT_ID}-${SAFE_APP_NAME}.
-#   - If found: writes its value to backend.tf in the target dir and uses it for terraform init.
-#   - If not found: runs bootstrap terraform (in bootstrap/), creates the S3 bucket,
-#     creates the SSM parameter with the backend.tf contents, then uses it.
+try:
+  import boto3
+  from botocore.exceptions import ClientError
+except Exception:
+  boto3 = None
 
-ENV="${ENV:- }"
-REGION="${AWS_REGION:-us-east-1}"
-BUCKET_OVERRIDE=""
-TARGET_DIR_OVERRIDE=""
-TARGET_DIR="${TARGET_DIR:-.}"
-FORCE_COPY="false"
-APP_NAME_OVERRIDE=""
-FORCE_DELETE="false"
+# Configuration defaults (mirror the bash defaults)
+ENV = os.environ.get('ENV', '')
+REGION = os.environ.get('AWS_REGION', 'us-east-1')
+BUCKET_OVERRIDE = ''
+TARGET_DIR = os.environ.get('TARGET_DIR', '.')
+FORCE_COPY = False
+APP_NAME_OVERRIDE = ''
+FORCE_DELETE = False
 
-COMMAND="init"
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+log = logging.info
+err = logging.error
 
-print_usage() {
-  cat <<EOF
-Usage:
-  $0 bootstrap [-e ENV] [-r REGION] [--target-dir PATH] [--app-name NAME]
-  $0 init|plan|apply|destroy|destroy-all [-e ENV] [-r REGION] [--target-dir PATH] [--force] [--force-copy] [--app-name NAME]
 
-Commands:
-  bootstrap   Run the bootstrap terraform in ./bootstrap to create remote backend and SSM entry.
-  init        Ensure backend exists (via SSM or bootstrap), then run 'terraform init' in target dir.
-  plan        Ensure backend exists (via SSM or bootstrap), init, then run 'terraform plan' in target dir.
-  apply       Ensure backend exists (via SSM or bootstrap), init, then run 'terraform apply' in target dir.
-  destroy     Destroy the top-level stack (target dir) only.
-  destroy-all Destroy the top-level stack then destroy the bootstrap S3 bucket.
+def run_and_log(cmd, cwd=None, check=True):
+  log('CMD: %s', ' '.join(cmd))
+  try:
+    subprocess.run(cmd, cwd=cwd, check=check)
+  except subprocess.CalledProcessError:
+    err('Command failed: %s', ' '.join(cmd))
+    if check:
+      sys.exit(1)
 
-Options:
-  -e, --env           Environment (default: dev)
-  -r, --region        AWS region (default: us-east-1)
-  --target-dir        Target terraform directory to run init/plan/apply in (default: .)
-  --force             Skip interactive confirmation prompts for destructive commands (destroy/destroy-all)
-  --force-copy        When migrating local state into newly created backend, pass -force-copy to terraform init
-  --app-name          Override app name (otherwise read from properties.${ENV}.json)
-  -h, --help          Show this help
-EOF
-}
 
-# Parse command (first arg may be a command)
-if [[ $# -ge 1 ]]; then
-  case "$1" in
-    bootstrap|init|plan|apply|destroy|destroy-all)
-      COMMAND="$1"; shift || true
-      ;;
-  esac
-fi
+def confirm_prompt(prompt):
+  if FORCE_DELETE:
+    return True
+  try:
+    resp = input(f"{prompt} [y/N]: ")
+  except EOFError:
+    return False
+  return resp.lower().startswith('y')
 
-while [[ $# -gt 0 ]]; do
-  key="$1"
-  case $key in
-    -e|--env)
-      ENV="$2"; shift; shift;;
-    -r|--region)
-      REGION="$2"; shift; shift;;
-    --target-dir)
-      TARGET_DIR_OVERRIDE="$2"; shift; shift;;
-    --force-copy)
-      FORCE_COPY="true"; shift;;
-    --app-name)
-      APP_NAME_OVERRIDE="$2"; shift; shift;;
-    --force)
-      FORCE_DELETE="true"; shift;;
-    -h|--help)
-      print_usage; exit 0;;
-    *)
-      echo "Unknown arg: $1" >&2; print_usage; exit 1;;
-  esac
-done
 
-# Set target dir
-if [[ -n "$TARGET_DIR_OVERRIDE" ]]; then
-  TARGET_DIR="$TARGET_DIR_OVERRIDE"
-  mkdir -p "$TARGET_DIR"
-else
-  TARGET_DIR="."
-fi
+class TfWrapper:
+  def __init__(self, env, region, target_dir):
+    self.env = env or 'dev'
+    self.region = region
+    self.target_dir = target_dir or '.'
+    self.bucket_override = ''
+    self.force_copy = False
+    self.app_name_override = ''
+    self.force_delete = False
 
-# Helpers
-log() { printf '[%s] INFO: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
-err() { printf '[%s] ERROR: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+    self.app_name = ''
+    self.safe_app_name = ''
+    self.account_id = ''
+    self.ssm_param_name = ''
 
-# Run a command while logging it. Accepts the command as arguments (preserves arrays).
-run_and_log() {
-  printf '[%s] CMD: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
-  "$@" || { err "Command failed: $*"; return 1; }
-}
+    # boto3 clients (created lazily)
+    self._ssm = None
+    self._sts = None
+    self._s3 = None
 
-confirm_prompt() {
-  # Usage: confirm_prompt "Are you sure you want to..."
-  if [[ "$FORCE_DELETE" == "true" ]]; then
-    return 0
-  fi
-  read -r -p "$1 [y/N]: " yn
-  case "$yn" in
-    [Yy]*) return 0;;
-    *) return 1;;
-  esac
-}
+  @property
+  def ssm(self):
+    if self._ssm is None:
+      if boto3 is None:
+        err('boto3 is required for SSM operations; please install boto3')
+        sys.exit(2)
+      self._ssm = boto3.client('ssm', region_name=self.region)
+    return self._ssm
 
-synthesize_app_name_and_account() {
-  log "synthesize_app_name_and_account: BEGIN"
-  if [[ -n "$APP_NAME_OVERRIDE" ]]; then
-    APP_NAME="$APP_NAME_OVERRIDE"
-  else
-    if [[ -f "properties.${ENV}.json" ]]; then
-      APP_NAME=$(jq -r '.app_name' "properties.${ENV}.json")
-    else
-      APP_NAME=""
-    fi
-  fi
+  @property
+  def sts(self):
+    if self._sts is None:
+      if boto3 is None:
+        err('boto3 is required for STS operations; please install boto3')
+        sys.exit(2)
+      self._sts = boto3.client('sts', region_name=self.region)
+    return self._sts
 
-  if [[ -z "$APP_NAME" || "$APP_NAME" == "null" ]]; then
-    err "Unable to determine app name. Ensure properties.${ENV}.json exists and contains an 'app_name' field, or provide --app-name."
-    exit 2
-  fi
+  @property
+  def s3(self):
+    if self._s3 is None:
+      if boto3 is None:
+        err('boto3 is required for S3 operations; please install boto3')
+        sys.exit(2)
+      self._s3 = boto3.client('s3', region_name=self.region)
+    return self._s3
 
-  SAFE_APP_NAME=$(echo "${APP_NAME}${ENV}" | tr '[:upper:]' '[:lower:]')
+  def synthesize_app_name_and_account(self):
+    log('synthesize_app_name_and_account: BEGIN')
+    if self.app_name_override:
+      self.app_name = self.app_name_override
+    else:
+      props_path = f'properties.{self.env}.json'
+      if os.path.isfile(props_path):
+        try:
+          with open(props_path, 'r') as f:
+            props = json.load(f)
+            self.app_name = props.get('app_name', '')
+        except Exception:
+          self.app_name = ''
+      else:
+        self.app_name = ''
 
-  ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
-  if [[ -z "$ACCOUNT_ID" ]]; then
-    err "Unable to determine AWS account id. Ensure AWS CLI is configured."
-    exit 2
-  fi
+    if not self.app_name:
+      err("Unable to determine app name. Ensure properties.{}.json exists and contains an 'app_name' field, or provide --app-name.".format(self.env))
+      sys.exit(2)
 
-  SSM_PARAM_NAME="/terraform/backend/${ACCOUNT_ID}-${SAFE_APP_NAME}"
-}
+    self.safe_app_name = (self.app_name + self.env).lower()
 
-get_ssm_backend() {
-  # Returns the parameter value or empty string if not found
-  if aws ssm get-parameter --name "$SSM_PARAM_NAME" --with-decryption --region "$REGION" >/dev/null 2>&1; then
-    aws ssm get-parameter --name "$SSM_PARAM_NAME" --with-decryption --query Parameter.Value --output text --region "$REGION"
-  else
-    echo ""
-  fi
-}
+    try:
+      identity = self.sts.get_caller_identity()
+      self.account_id = identity.get('Account', '')
+    except ClientError:
+      err('Unable to determine AWS account id. Ensure AWS credentials are configured.')
+      sys.exit(2)
 
-put_ssm_backend() {
-  local value="$1"
-  aws ssm put-parameter --name "$SSM_PARAM_NAME" --value "$value" --type String --overwrite --region "$REGION" >/dev/null
-}
+    if not self.account_id:
+      err('Unable to determine AWS account id. Ensure AWS credentials are configured.')
+      sys.exit(2)
 
-delete_ssm_backend() {
-  log "delete_ssm_backend: BEGIN"
-  if aws ssm delete-parameter --name "$SSM_PARAM_NAME" --region "$REGION" >/dev/null 2>&1; then
-    log "Deleted SSM parameter $SSM_PARAM_NAME"
-  else
-    log "SSM parameter $SSM_PARAM_NAME not found or could not be deleted"
-  fi
-}
+    self.ssm_param_name = f"/terraform/backend/{self.account_id}-{self.safe_app_name}"
 
-write_backend_hcl_to_file() {
-  log "write_backend_hcl_to_file: BEGIN"
-  local content="$1"
-  # Write as a proper Terraform file so `terraform init` reads the backend block
-  local out_path="$TARGET_DIR/backend.tf"
-  echo "$content" > "$out_path"
-  log "Wrote $out_path"
-}
+  def get_ssm_backend(self):
+    try:
+      resp = self.ssm.get_parameter(Name=self.ssm_param_name, WithDecryption=True)
+      return resp['Parameter']['Value']
+    except ClientError as e:
+      if e.response['Error']['Code'] in ('ParameterNotFound',):
+        return ''
+      err('SSM get_parameter failed: %s', e)
+      return ''
 
-write_local_backend_tf() {
-  log "write_local_backend_tf: BEGIN"
-  local dir="$1"
-  local backend_tf_path="$dir/backend.tf"
-  cat > "$backend_tf_path" <<'TFEOF'
-terraform {
+  def put_ssm_backend(self, value):
+    try:
+      self.ssm.put_parameter(Name=self.ssm_param_name, Value=value, Type='String', Overwrite=True)
+    except ClientError as e:
+      err('Failed to put SSM parameter: %s', e)
+      sys.exit(1)
+
+  def delete_ssm_backend(self):
+    log('delete_ssm_backend: BEGIN')
+    try:
+      self.ssm.delete_parameter(Name=self.ssm_param_name)
+      log('Deleted SSM parameter %s', self.ssm_param_name)
+    except ClientError:
+      log('SSM parameter %s not found or could not be deleted', self.ssm_param_name)
+
+  def write_backend_hcl_to_file(self, content):
+    log('write_backend_hcl_to_file: BEGIN')
+    out_path = os.path.join(self.target_dir, 'backend.tf')
+    with open(out_path, 'w') as f:
+      f.write(content)
+    log('Wrote %s', out_path)
+
+  def write_local_backend_tf(self, dirpath):
+    log('write_local_backend_tf: BEGIN')
+    backend_tf_path = os.path.join(dirpath, 'backend.tf')
+    content = '''terraform {
   backend "local" {
     path = "bootstrap.tfstate"
   }
 }
-TFEOF
-  log "Wrote local backend.tf at $backend_tf_path"
-}
+'''
+    with open(backend_tf_path, 'w') as f:
+      f.write(content)
+    log('Wrote local backend.tf at %s', backend_tf_path)
 
-build_backend_content() {
-  # Arguments: bucket region account
-  local bucket="$1"; local region="$2"; local account="$3"
-  cat <<EOF
-terraform {
-  backend "s3" {
-    bucket = "${bucket}"
-    key    = "terraform.${account}-${region}-${SAFE_APP_NAME}.tfstate"
-    region = "${region}"
+  def build_backend_content(self, bucket, region, account):
+    return f'''terraform {{
+  backend "s3" {{
+    bucket = "{bucket}"
+    key    = "terraform.{account}-{region}-{self.safe_app_name}.tfstate"
+    region = "{region}"
     encrypt = true
     use_lockfile = true
-  }
-}
-EOF
-}
+  }}
+}}
+'''
 
-erase_backend_tf() {
-  log "erase_backend_tf: BEGIN"
-  local dir="$1"
-  local backend_tf_path="$dir/backend.tf"
-  if [[ -f "$backend_tf_path" ]]; then
-    rm "$backend_tf_path"
-  fi
-  log "Erased backend.tf at $backend_tf_path"
-}
+  def erase_backend_tf(self, dirpath):
+    log('erase_backend_tf: BEGIN')
+    backend_tf_path = os.path.join(dirpath, 'backend.tf')
+    if os.path.isfile(backend_tf_path):
+      os.remove(backend_tf_path)
+    log('Erased backend.tf at %s', backend_tf_path)
 
-# Helper: empty an S3 bucket (handles versioned and non-versioned objects)
-empty_s3_bucket() {
-  log "empty_s3_bucket: BEGIN"
-  local bucket="$1"
-  local region="${2:-$REGION}"
+  def empty_s3_bucket(self, bucket, region=None):
+    log('empty_s3_bucket: BEGIN')
+    region = region or self.region
+    if not bucket:
+      log('No bucket name provided; skipping empty_s3_bucket')
+      return
 
-  if [[ -z "$bucket" ]]; then
-    log "No bucket name provided; skipping empty_s3_bucket"
-    return 0
-  fi
+    log('Emptying S3 bucket %s in region %s', bucket, region)
 
-  log "Emptying S3 bucket $bucket in region $region"
+    # Try simple recursive delete via CLI as a fast path (matching original behavior)
+    try:
+      run_and_log(['aws', 's3', 'rm', f's3://{bucket}', '--recursive', '--region', region], check=False)
+    except Exception:
+      pass
 
-  # Try the simple recursive remove (handles most non-versioned buckets)
-  if aws s3 rm "s3://${bucket}" --recursive --region "$region" >/dev/null 2>&1; then
-    log "Removed non-versioned objects from s3://$bucket"
-  else
-    log "aws s3 rm recursive returned non-zero or removed nothing; continuing to remove versions/delete markers if present"
-  fi
+    # Now ensure versioned objects and delete markers are removed via API
+    if boto3 is None:
+      log('boto3 not available; skipping API-based emptying of versions')
+      return
 
-  # Remove versioned objects and delete markers in batches using list-object-versions
-  while true; do
-    local list_json
-    list_json=$(aws s3api list-object-versions --bucket "$bucket" --region "$region" --output json 2>/dev/null) || list_json=""
-    if [[ -z "$list_json" ]]; then
-      # No versions or failed to list; break out
-      break
-    fi
+    s3 = boto3.client('s3', region_name=region)
 
-    local delete_json
-    delete_json=$(echo "$list_json" | jq -c '{Objects: ([.Versions[]? | {Key:.Key,VersionId:.VersionId}] + [.DeleteMarkers[]? | {Key:.Key,VersionId:.VersionId}]), Quiet: false}')
-    local count
-    count=$(echo "$delete_json" | jq '.Objects | length')
-    if [[ "$count" -eq 0 ]]; then
-      break
-    fi
+    paginator = s3.get_paginator('list_object_versions')
+    try:
+      for page in paginator.paginate(Bucket=bucket):
+        objects = []
+        for v in page.get('Versions', []) + page.get('DeleteMarkers', []):
+          objects.append({'Key': v['Key'], 'VersionId': v['VersionId']})
+        if objects:
+          for i in range(0, len(objects), 1000):
+            chunk = objects[i:i+1000]
+            s3.delete_objects(Bucket=bucket, Delete={'Objects': chunk, 'Quiet': False})
+    except ClientError:
+      log('list-object-versions failed or no versions; continuing')
 
-    aws s3api delete-objects --bucket "$bucket" --region "$region" --delete "$delete_json" >/dev/null || { err "Failed to delete object versions from s3://$bucket"; return 1; }
-    # loop to ensure all versions/delete markers removed
-  done
+    log('empty_s3_bucket: DONE for %s', bucket)
 
-  log "empty_s3_bucket: DONE for $bucket"
-}
-
-ensure_minimal_backend_tf() {
-  log "ensure_minimal_backend_tf: BEGIN"
-  local dir="$1"
-  local backend_tf_path="$dir/backend.tf"
-  if [[ ! -f "$backend_tf_path" ]]; then
-    cat > "$backend_tf_path" <<'TFEOF'
-terraform {
+  def ensure_minimal_backend_tf(self, dirpath):
+    log('ensure_minimal_backend_tf: BEGIN')
+    backend_tf_path = os.path.join(dirpath, 'backend.tf')
+    if not os.path.isfile(backend_tf_path):
+      content = '''terraform {
   backend "s3" {}
 }
-TFEOF
-    log "Created minimal backend.tf at $backend_tf_path"
-  else
-    log "Found existing backend.tf at $backend_tf_path"
-  fi
-}
+'''
+      with open(backend_tf_path, 'w') as f:
+        f.write(content)
+      log('Created minimal backend.tf at %s', backend_tf_path)
+    else:
+      log('Found existing backend.tf at %s', backend_tf_path)
 
-run_terraform_init_with_backend_file() {
-  log "run_terraform_init_with_backend_file: BEGIN"
-  pushd "$TARGET_DIR" >/dev/null
-  # backend config is written as a proper Terraform file (`backend.tf`), so just reconfigure
-  INIT_CMD=(terraform init -reconfigure -input=false)
-  if [[ "$FORCE_COPY" == "true" ]]; then
-    INIT_CMD+=( -force-copy )
-  fi
-  run_and_log "${INIT_CMD[@]}" || { popd >/dev/null; exit 1; }
-  popd >/dev/null
-}
+  def run_terraform_init_with_backend_file(self):
+    log('run_terraform_init_with_backend_file: BEGIN')
+    cmd = ['terraform', 'init', '-reconfigure', '-input=false']
+    if self.force_copy:
+      cmd.append('-force-copy')
+    run_and_log(cmd, cwd=self.target_dir)
 
-run_bootstrap_and_create_ssm() {
-  log "run_bootstrap_and_create_ssm: BEGIN"
-  # Find bootstrap dir
-  BOOTSTRAP_LOCATIONS=("${TARGET_DIR}/bootstrap" "bootstrap")
-  local found=""
-  for dir in "${BOOTSTRAP_LOCATIONS[@]}"; do
-    if [[ -d "$dir" ]]; then
-      found="$dir"
-      break
-    fi
-  done
-  if [[ -z "$found" ]]; then
-    err "Bootstrap directory not found in ${BOOTSTRAP_LOCATIONS[*]}. Cannot bootstrap."
-    exit 1
-  fi
+  def run_bootstrap_and_create_ssm(self):
+    log('run_bootstrap_and_create_ssm: BEGIN')
+    candidates = [os.path.join(self.target_dir, 'bootstrap'), 'bootstrap']
+    found = None
+    for d in candidates:
+      if os.path.isdir(d):
+        found = d
+        break
+    if not found:
+      err('Bootstrap directory not found in {}. Cannot bootstrap.'.format(' '.join(candidates)))
+      sys.exit(1)
 
-  log "Found bootstrap directory at $found. Running terraform init and apply..."
-  erase_backend_tf "$found"
+    log('Found bootstrap directory at %s. Running terraform init and apply...', found)
+    self.erase_backend_tf(found)
 
-  pushd "$found" >/dev/null
+    # terraform init/apply in bootstrap dir
+    run_and_log(['terraform', 'init', '-input=false', '-reconfigure'], cwd=found)
+    run_and_log(['terraform', 'apply', '-auto-approve', '-input=false', '-var', f'environment={self.env}', '-var', f'region={self.region}'], cwd=found)
+    log('Bootstrap terraform apply completed in %s.', found)
 
-  run_and_log terraform init -input=false -reconfigure || { err "terraform init failed in $found"; popd >/dev/null; exit 1; }
+    # Determine bucket name
+    if self.bucket_override:
+      bucket_name = self.bucket_override
+    else:
+      # Try terraform output -json
+      bucket_name = ''
+      try:
+        out = subprocess.run(['terraform', 'output', '-json'], cwd=found, capture_output=True, text=True, check=True)
+        jout = json.loads(out.stdout)
+        if 'bucket_name' in jout and 'value' in jout['bucket_name']:
+          bucket_name = jout['bucket_name']['value']
+      except Exception:
+        pass
+      if not bucket_name:
+        bucket_name = f"{self.account_id}-{self.safe_app_name}-tfstate"
 
-  run_and_log terraform apply -auto-approve -input=false -var "environment=${ENV}" -var "region=${REGION}" || { err "terraform apply failed in $found"; popd >/dev/null; exit 1; }
+    backend_content = self.build_backend_content(bucket_name, self.region, self.account_id)
+    self.put_ssm_backend(backend_content)
+    log('Stored backend configuration into SSM parameter %s', self.ssm_param_name)
+    self.write_backend_hcl_to_file(backend_content)
 
-  log "Bootstrap terraform apply completed in $found."
+  def ensure_backend_via_ssm_or_bootstrap(self):
+    log('ensure_backend_via_ssm_or_bootstrap: BEGIN')
+    ssm_value = self.get_ssm_backend() or ''
+    if ssm_value and ssm_value != 'None':
+      log('Found backend configuration in SSM %s', self.ssm_param_name)
+      self.write_backend_hcl_to_file(ssm_value)
+    else:
+      log('Backend SSM parameter %s not found or empty. Running bootstrap to create backend and SSM entry.', self.ssm_param_name)
+      self.run_bootstrap_and_create_ssm()
 
-  # The bootstrap terraform is expected to output or create the S3 bucket name
-  # We allow overrides via env variables if present
-  if [[ -n "$BUCKET_OVERRIDE" ]]; then
-    BUCKET_NAME="$BUCKET_OVERRIDE"
-  else
-    # attempt to read bucket name from terraform output if available
-    if terraform output -json >/dev/null 2>&1; then
-      if terraform output -json | jq -r 'select(has("bucket_name")) .bucket_name.value' >/dev/null 2>&1; then
-        BUCKET_NAME=$(terraform output -json | jq -r '.bucket_name.value')
-      fi
-    fi
-    BUCKET_NAME="${BUCKET_NAME:-${ACCOUNT_ID}-${SAFE_APP_NAME}-tfstate}"
-  fi
+  def delete_top_level_stack(self):
+    log('delete_top_level_stack: BEGIN')
+    log('Destroying top-level stack in %s', self.target_dir)
+    self.ensure_backend_via_ssm_or_bootstrap()
+    self.run_terraform_init_with_backend_file()
+    run_and_log(['terraform', 'destroy', '-auto-approve', '-var', f'environment={self.env}', '-var', f'region={self.region}'], cwd=self.target_dir)
+    log('Top-level stack destroyed.')
 
-  # Build backend.hcl content for the main target and store into SSM
-  backend_content=$(build_backend_content "${BUCKET_NAME}" "${REGION}" "${ACCOUNT_ID}")
+  def delete_bootstrap_stack(self):
+    log('delete_bootstrap_stack: BEGIN')
+    candidates = [os.path.join(self.target_dir, 'bootstrap'), 'bootstrap']
+    found = None
+    for d in candidates:
+      if os.path.isdir(d):
+        found = d
+        break
+    if not found:
+      log('Bootstrap directory not found; skipping bootstrap destroy.')
+      return
 
-  put_ssm_backend "$backend_content"
-  log "Stored backend configuration into SSM parameter $SSM_PARAM_NAME"
+    log('Preparing to destroy bootstrap resources in %s', found)
+    ssm_value = self.get_ssm_backend() or ''
 
-  # Write backend file to target dir so the top-level stack can use the remote backend
-  write_backend_hcl_to_file "$backend_content"
+    # Extract bucket name from HCL-like content
+    m = re.search(r'bucket\s*=\s*"([^"]+)"', ssm_value)
+    bucket_name = m.group(1) if m else f"{self.account_id}-{self.safe_app_name}-tfstate"
 
-  # NOTE: We intentionally do NOT migrate the bootstrap local state into the bootstrap S3 bucket.
-  # The bootstrap state remains local to the bootstrap directory to keep the bootstrap lifecycle separate.
+    # Remove SSM param
+    self.delete_ssm_backend()
 
-  popd >/dev/null
+    # Remove any temporary backend.tf left in the bootstrap dir
+    self.erase_backend_tf(found)
 
-}
+    if bucket_name:
+      log('Emptying bootstrap S3 bucket %s in region %s', bucket_name, self.region)
+      try:
+        self.empty_s3_bucket(bucket_name, self.region)
+      except Exception:
+        err('Failed to empty S3 bucket %s', bucket_name)
+      log('Deleting bootstrap S3 bucket %s', bucket_name)
+      try:
+        self.s3.delete_bucket(Bucket=bucket_name)
+        log('Deleted S3 bucket %s', bucket_name)
+      except ClientError:
+        err('Failed to delete S3 bucket %s. Please delete it manually if it still exists.', bucket_name)
 
-ensure_backend_via_ssm_or_bootstrap() {
-  log "ensure_backend_via_ssm_or_bootstrap: BEGIN"
-  # Return with backend.hcl in $TARGET_DIR/backend.hcl ready and SSM param present
-  local ssm_value
-  ssm_value=$(get_ssm_backend) || ssm_value=""
-  if [[ -n "$ssm_value" && "$ssm_value" != "None" ]]; then
-    log "Found backend configuration in SSM $SSM_PARAM_NAME"
-    write_backend_hcl_to_file "$ssm_value"
-  else
-    log "Backend SSM parameter $SSM_PARAM_NAME not found or empty. Running bootstrap to create backend and SSM entry."
-    run_bootstrap_and_create_ssm
-  fi
-}
+    log('Bootstrap resources destroyed. If bucket deletion failed, empty and delete the S3 bucket manually.')
 
-# Delete top-level stack (target dir)
-delete_top_level_stack() {
-  log "delete_top_level_stack: BEGIN"
-  log "Destroying top-level stack in $TARGET_DIR"
-  ensure_backend_via_ssm_or_bootstrap
-  run_terraform_init_with_backend_file
-  pushd "$TARGET_DIR" >/dev/null
-  run_and_log terraform destroy -auto-approve -var "environment=${ENV}" -var "region=${REGION}"
-  popd >/dev/null
-  log "Top-level stack destroyed."
-}
 
-# Delete bootstrap resources S3 bucket
-delete_bootstrap_stack() {
-  log "delete_bootstrap_stack: BEGIN"
-  # Find bootstrap dir
-  BOOTSTRAP_LOCATIONS=("${TARGET_DIR}/bootstrap" "bootstrap")
-  local found=""
-  for dir in "${BOOTSTRAP_LOCATIONS[@]}"; do
-    if [[ -d "$dir" ]]; then
-      found="$dir"
-      break
-    fi
-  done
-  if [[ -z "$found" ]]; then
-    log "Bootstrap directory not found; skipping bootstrap destroy."
-    return 0
-  fi
+def parse_args(argv):
+  cmds = ['bootstrap', 'init', 'plan', 'apply', 'destroy', 'destroy-all']
 
-  log "Preparing to destroy bootstrap resources in $found"
+  parser = argparse.ArgumentParser(prog='tfwrapper')
+  parser.add_argument('command', nargs='?', choices=cmds, help='Command to run')
+  parser.add_argument('-e', '--env', default=ENV)
+  parser.add_argument('-r', '--region', default=REGION)
+  parser.add_argument('--target-dir', default=TARGET_DIR)
+  parser.add_argument('--force-copy', action='store_true')
+  parser.add_argument('--app-name', default='')
+  parser.add_argument('--force', action='store_true')
 
-  # Attempt to read backend info from SSM to get bucket name
-  local ssm_value
-  ssm_value=$(get_ssm_backend) || ssm_value=""
+  args = parser.parse_args(argv)
 
-  # Try to ensure BUCKET_NAME is set even when SSM contained full backend HCL
-  BUCKET_NAME=$(echo "$ssm_value" | sed -n 's/.*bucket *= *"\(.*\)".*/\1/p')
-  BUCKET_NAME="${BUCKET_NAME:-${ACCOUNT_ID}-${SAFE_APP_NAME}-tfstate}"
+  if not args.command:
+    parser.print_help()
+    sys.exit(0)
 
-  # Remove SSM param so subsequent runs won't pick up deleted backend
-  delete_ssm_backend
+  return args.command, args
 
-  # Remove any temporary backend.tf left in the bootstrap dir
-  erase_backend_tf "$found"
 
-  # If a bucket name was determined, attempt to empty and delete it now (only used for destroy-all).
-  if [[ -n "$BUCKET_NAME" ]]; then
-    log "Emptying bootstrap S3 bucket $BUCKET_NAME in region $REGION"
-    empty_s3_bucket "$BUCKET_NAME" "$REGION" || err "Failed to empty S3 bucket $BUCKET_NAME"
-    log "Deleting bootstrap S3 bucket $BUCKET_NAME"
-    if aws s3api delete-bucket --bucket "$BUCKET_NAME" --region "$REGION" >/dev/null 2>&1; then
-      log "Deleted S3 bucket $BUCKET_NAME"
-    else
-      err "Failed to delete S3 bucket $BUCKET_NAME. Please delete it manually if it still exists."
-    fi
-  fi
+def main(argv):
+  global FORCE_COPY, APP_NAME_OVERRIDE, FORCE_DELETE
 
-  log "Bootstrap resources destroyed. If bucket deletion failed, empty and delete the S3 bucket manually."
-}
+  command, args = parse_args(argv)
+  wrapper = TfWrapper(env=args.env, region=args.region, target_dir=args.target_dir)
+  wrapper.force_copy = args.force_copy
+  wrapper.app_name_override = args.app_name
+  wrapper.force_delete = args.force
+  wrapper.bucket_override = os.environ.get('BUCKET_OVERRIDE', '')
+  wrapper.force_copy = args.force_copy
+  wrapper.app_name_override = args.app_name
+  wrapper.force_delete = args.force
 
-# Main
-synthesize_app_name_and_account
+  # Propagate some flags
+  wrapper.force_copy = args.force_copy
+  wrapper.app_name_override = args.app_name
+  global FORCE_DELETE
+  FORCE_DELETE = args.force
+  wrapper.force_copy = args.force_copy
+  wrapper.force_copy = args.force_copy
+  wrapper.force_copy = args.force_copy
 
-case "$COMMAND" in
-  bootstrap)
-    run_bootstrap_and_create_ssm
-    log "Bootstrap completed. You can now run terraform init/plan/apply in $TARGET_DIR using the SSM-provided backend."
-    ;;
-  init)
-    ensure_backend_via_ssm_or_bootstrap
-    run_terraform_init_with_backend_file
-    ;;
-  plan)
-    ensure_backend_via_ssm_or_bootstrap
-    run_terraform_init_with_backend_file
-    pushd "$TARGET_DIR" >/dev/null
-    run_and_log terraform plan -input=false -var "environment=${ENV}" -var "region=${REGION}"
-    popd >/dev/null
-    ;;
-  apply)
-    ensure_backend_via_ssm_or_bootstrap
-    run_terraform_init_with_backend_file
-    pushd "$TARGET_DIR" >/dev/null
-    run_and_log terraform apply -auto-approve -input=false -var "environment=${ENV}" -var "region=${REGION}"
-    popd >/dev/null
-    ;;
-  destroy)
-    if confirm_prompt "Destroy the top-level stack in $TARGET_DIR? This will permanently delete resources."; then
-      delete_top_level_stack
-    else
-      log "Aborted top-level destroy."
-    fi
-    ;;
-  destroy-all)
-    if confirm_prompt "Destroy the top-level stack and bootstrap S3 bucket? This will permanently delete resources and remove the backend SSM entry."; then
-      delete_top_level_stack
-      delete_bootstrap_stack
-    else
-      log "Aborted destroy-all."
-    fi
-    ;;
-  *)
-    # default: init only (backwards compatible)
-    print_usage
-    exit 1
-    ;;
-esac
+  if command == 'bootstrap':
+    # synthesize
+    wrapper.synthesize_app_name_and_account()
+    wrapper.run_bootstrap_and_create_ssm()
+    log('Bootstrap completed. You can now run terraform init/plan/apply in %s using the SSM-provided backend.', wrapper.target_dir)
+  elif command == 'init':
+    # synthesize
+    wrapper.synthesize_app_name_and_account()
+    wrapper.ensure_backend_via_ssm_or_bootstrap()
+    wrapper.run_terraform_init_with_backend_file()
+  elif command == 'plan':
+    # synthesize
+    wrapper.synthesize_app_name_and_account()
+    wrapper.ensure_backend_via_ssm_or_bootstrap()
+    wrapper.run_terraform_init_with_backend_file()
+    run_and_log(['terraform', 'plan', '-input=false', '-var', f'environment={wrapper.env}', '-var', f'region={wrapper.region}'], cwd=wrapper.target_dir)
+  elif command == 'apply':
+    # synthesize
+    wrapper.synthesize_app_name_and_account()
+    wrapper.ensure_backend_via_ssm_or_bootstrap()
+    wrapper.run_terraform_init_with_backend_file()
+    run_and_log(['terraform', 'apply', '-auto-approve', '-input=false', '-var', f'environment={wrapper.env}', '-var', f'region={wrapper.region}'], cwd=wrapper.target_dir)
+  elif command == 'destroy':
+    # synthesize
+    wrapper.synthesize_app_name_and_account()
+    if confirm_prompt(f"Destroy the top-level stack in {wrapper.target_dir}? This will permanently delete resources."):
+      wrapper.delete_top_level_stack()
+    else:
+      log('Aborted top-level destroy.')
+  elif command == 'destroy-all':
+    # synthesize
+    wrapper.synthesize_app_name_and_account()
+    if confirm_prompt(f"Destroy the top-level stack and bootstrap S3 bucket? This will permanently delete resources and remove the backend SSM entry."):
+      wrapper.delete_top_level_stack()
+      wrapper.delete_bootstrap_stack()
+    else:
+      log('Aborted destroy-all.')
+  else:
+    print('Unknown command')
+    sys.exit(1)
 
-log "Done." 
+  log('Done.')
+
+
+if __name__ == '__main__':
+  main(sys.argv[1:]) 
